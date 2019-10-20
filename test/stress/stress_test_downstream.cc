@@ -16,8 +16,9 @@ class ClientStream : public Http::StreamDecoder,
                      public Http::StreamCallbacks,
                      Logger::Loggable<Logger::Id::testing> {
 public:
-  ClientStream(uint32_t id, ClientConnection& connection, ClientResponseCallback& callback)
-      : id_(id), connection_(connection), callback_(callback) {}
+  ClientStream(uint32_t id, ClientConnection& connection, ClientResponseCallback& callback,
+               TimeSource& time_source)
+      : id_(id), connection_(connection), callback_(callback), time_source_(time_source) {}
   ClientStream(const ClientStream&) = delete;
 
   void operator=(const ClientStream&) = delete;
@@ -135,12 +136,15 @@ public:
 
     ENVOY_LOG(debug, "ClientStream({}:{}:{}) sending request headers", connection_.name(),
               connection_.id(), id_);
+    start_time_ = time_source_.monotonicTime();
     encoder.encodeHeaders(request_headers, true);
 
     timeout_timer_ = connection_.dispatcher().createTimer([this, timeout]() {
       ENVOY_LOG(debug, "ClientStream({}:{}:{}) timed out after {} msec waiting for response",
                 connection_.name(), connection_.id(), id_, static_cast<long int>(timeout.count()));
-      callback_(connection_, nullptr);
+      callback_(connection_, nullptr,
+                std::chrono::duration_cast<std::chrono::microseconds>(time_source_.monotonicTime() -
+                                                                      start_time_));
       connection_.removeStream(id_);
       // This stream is now destroyed
     });
@@ -150,7 +154,10 @@ public:
 private:
   void onEndStream() {
     ENVOY_LOG(debug, "ClientStream({}:{}:{}) complete", connection_.name(), connection_.id(), id_);
-    callback_(connection_, std::move(response_headers_));
+
+    callback_(connection_, std::move(response_headers_),
+              std::chrono::duration_cast<std::chrono::microseconds>(time_source_.monotonicTime() -
+                                                                    start_time_));
     connection_.removeStream(id_);
     // This stream is now destroyed
   }
@@ -160,6 +167,8 @@ private:
   Http::HeaderMapPtr response_headers_{nullptr};
   ClientResponseCallback& callback_;
   Event::TimerPtr timeout_timer_{nullptr};
+  MonotonicTime start_time_;
+  TimeSource& time_source_;
 };
 
 class HttpClientReadFilter : public Network::ReadFilter, Logger::Loggable<Logger::Id::testing> {
@@ -205,11 +214,11 @@ static constexpr uint32_t max_request_headers_count = 100U;
 class Http1ClientConnection : public ClientConnection {
 public:
   Http1ClientConnection(Client& client, uint32_t id, ClientConnectCallback& connect_callback,
-                        ClientCloseCallback& close_callback,
+                        ClientCloseCallback& close_callback, TimeSource& time_source,
                         std::shared_ptr<Event::Dispatcher>& dispatcher,
                         Network::ClientConnectionPtr&& network_connection)
-      : ClientConnection(client, id, connect_callback, close_callback, dispatcher), stats_(),
-        network_connection_(std::move(network_connection)),
+      : ClientConnection(client, id, connect_callback, close_callback, time_source, dispatcher),
+        stats_(), network_connection_(std::move(network_connection)),
         http_connection_(*network_connection_, stats_, *this, max_request_headers_count),
         read_filter_{std::make_shared<HttpClientReadFilter>(client.name(), id, http_connection_)} {
     network_connection_->addReadFilter(read_filter_);
@@ -233,11 +242,11 @@ private:
 class Http2ClientConnection : public ClientConnection {
 public:
   Http2ClientConnection(Client& client, uint32_t id, ClientConnectCallback& connect_callback,
-                        ClientCloseCallback& close_callback,
+                        ClientCloseCallback& close_callback, TimeSource& time_source,
                         std::shared_ptr<Event::Dispatcher>& dispatcher,
                         Network::ClientConnectionPtr&& network_connection)
-      : ClientConnection(client, id, connect_callback, close_callback, dispatcher), stats_(),
-        settings_(), network_connection_(std::move(network_connection)),
+      : ClientConnection(client, id, connect_callback, close_callback, time_source, dispatcher),
+        stats_(), settings_(), network_connection_(std::move(network_connection)),
         http_connection_(*network_connection_, *this, stats_, settings_, max_request_headers_kb,
                          max_request_headers_count),
         read_filter_{std::make_shared<HttpClientReadFilter>(client.name(), id, http_connection_)} {
@@ -264,7 +273,7 @@ ClientStream& ClientConnection::newStream(ClientResponseCallback& callback) {
   std::lock_guard<std::mutex> guard(streams_lock_);
 
   uint32_t id = stream_counter_++;
-  ClientStreamPtr stream = std::make_unique<ClientStream>(id, *this, callback);
+  ClientStreamPtr stream = std::make_unique<ClientStream>(id, *this, callback, time_source_);
   ClientStream* raw = stream.get();
   streams_[id] = std::move(stream);
 
@@ -273,10 +282,10 @@ ClientStream& ClientConnection::newStream(ClientResponseCallback& callback) {
 
 ClientConnection::ClientConnection(Client& client, uint32_t id,
                                    ClientConnectCallback& connect_callback,
-                                   ClientCloseCallback& close_callback,
+                                   ClientCloseCallback& close_callback, TimeSource& time_source,
                                    std::shared_ptr<Event::Dispatcher>& dispatcher)
     : client_(client), id_(id), connect_callback_(connect_callback),
-      close_callback_(close_callback), dispatcher_(dispatcher) {}
+      close_callback_(close_callback), time_source_(time_source), dispatcher_(dispatcher) {}
 
 ClientConnection::~ClientConnection() {
   ENVOY_LOG(trace, "ClientConnection({}:{}) destroyed", client_.name(), id_);
@@ -386,11 +395,11 @@ void Client::connect(Network::TransportSocketFactory& socket_factory,
 
     ClientConnectionPtr ptr;
     if (Http::CodecClient::Type::HTTP1 == http_version) {
-      ptr = std::make_unique<Http1ClientConnection>(*this, id, connect_cb, close_cb, dispatcher_,
-                                                    std::move(connection));
+      ptr = std::make_unique<Http1ClientConnection>(*this, id, connect_cb, close_cb, time_system_,
+                                                    dispatcher_, std::move(connection));
     } else {
-      ptr = std::make_unique<Http2ClientConnection>(*this, id, connect_cb, close_cb, dispatcher_,
-                                                    std::move(connection));
+      ptr = std::make_unique<Http2ClientConnection>(*this, id, connect_cb, close_cb, time_system_,
+                                                    dispatcher_, std::move(connection));
     }
     ClientConnection& raw = *ptr.get();
 
@@ -460,7 +469,8 @@ LoadGenerator::LoadGenerator(Client& client, Network::TransportSocketFactory& so
                              const Network::ConnectionSocket::OptionsSharedPtr& sockopts)
     : client_(client), socket_factory_(socket_factory), http_version_(http_version),
       address_(address), sockopts_(sockopts) {
-  response_callback_ = [this](ClientConnection& connection, Http::HeaderMapPtr&& response) {
+  response_callback_ = [this](ClientConnection& connection, Http::HeaderMapPtr&& response,
+                              std::chrono::microseconds latency) {
     if (!response) {
       ENVOY_LOG(debug, "Connection({}:{}) timedout waiting for response", connection.name(),
                 connection.id());
@@ -477,6 +487,7 @@ LoadGenerator::LoadGenerator(Client& client, Network::TransportSocketFactory& so
                 connection.id());
     } else if (200 <= status && status < 300) {
       stats_->class_2xx_.inc();
+      stats_->class_2xx_latency_usec_.recordValue(latency.count());
     } else if (300 <= status && status < 400) {
       stats_->class_3xx_.inc();
     } else if (400 <= status && status < 500) {
@@ -553,7 +564,8 @@ void LoadGenerator::run(uint32_t connections, uint32_t requests, Http::HeaderMap
 
   client_.post([this]() {
     stats_ = std::make_unique<Stats>(Stats{
-        ALL_LOAD_GENERATOR_STATS(POOL_COUNTER_PREFIX(client_.store(), client_.name() + "."))});
+        ALL_LOAD_GENERATOR_STATS(POOL_COUNTER_PREFIX(client_.store(), client_.name() + "."),
+                                 POOL_HISTOGRAM_PREFIX(client_.store(), client_.name() + "."))});
   });
 
   for (uint32_t i = 0; i < connections_to_initiate_; ++i) {

@@ -76,8 +76,10 @@ typedef std::function<void(ClientConnection& connection, ClientCloseReason reaso
  *
  * @param connection The connection that received the response.
  * @param response_headers The response headers or null if timed out.
+ * @param latency Latency in nanoseconds of the response... or timeout.
  */
-typedef std::function<void(ClientConnection& connection, Http::HeaderMapPtr&& response_headers)>
+typedef std::function<void(ClientConnection& connection, Http::HeaderMapPtr&& response_headers,
+                           std::chrono::microseconds latency)>
     ClientResponseCallback;
 
 class ClientConnection : public Network::ConnectionCallbacks,
@@ -86,7 +88,7 @@ class ClientConnection : public Network::ConnectionCallbacks,
                          protected Logger::Loggable<Logger::Id::testing> {
 public:
   ClientConnection(Client& client, uint32_t id, ClientConnectCallback& connect_callback,
-                   ClientCloseCallback& close_callback,
+                   ClientCloseCallback& close_callback, TimeSource& time_source,
                    std::shared_ptr<Event::Dispatcher>& dispatcher);
   ClientConnection(const ClientConnection&) = delete;
 
@@ -144,6 +146,7 @@ private:
   uint32_t id_;
   ClientConnectCallback& connect_callback_;
   ClientCloseCallback& close_callback_;
+  TimeSource& time_source_;
   std::shared_ptr<Event::Dispatcher> dispatcher_;
   bool established_{false};
 
@@ -221,7 +224,7 @@ private:
   uint32_t connection_counter_{0U};
 };
 
-#define ALL_LOAD_GENERATOR_STATS(COUNTER)                                                          \
+#define ALL_LOAD_GENERATOR_STATS(COUNTER, HISTOGRAM)                                               \
   COUNTER(class_2xx)                                                                               \
   COUNTER(class_3xx)                                                                               \
   COUNTER(class_4xx)                                                                               \
@@ -231,12 +234,13 @@ private:
   COUNTER(responses_received)                                                                      \
   COUNTER(response_timeouts)                                                                       \
   COUNTER(local_closes)                                                                            \
-  COUNTER(remote_closes)
+  COUNTER(remote_closes)                                                                           \
+  HISTOGRAM(class_2xx_latency_usec)
 
 class LoadGenerator : Logger::Loggable<Logger::Id::testing> {
 public:
   struct Stats {
-    ALL_LOAD_GENERATOR_STATS(GENERATE_COUNTER_STRUCT)
+    ALL_LOAD_GENERATOR_STATS(GENERATE_COUNTER_STRUCT, GENERATE_HISTOGRAM_STRUCT)
   };
 
   /**
